@@ -1,0 +1,129 @@
+rules_version = '2';
+
+// ============================================================
+// DION DIAMOND MAKER — Firestore Security Rules
+// ============================================================
+// Deploy with: firebase deploy --only firestore:rules
+// (requires the Firebase CLI + firebase.json pointing at this file)
+//
+// Admin = anyone signed in via Firebase Auth (admin.html uses
+// email/password sign-in). The website itself (index.html) never
+// signs in — all its reads/writes happen as an anonymous visitor,
+// so rules below are written from that point of view.
+// ============================================================
+
+function isAdmin() {
+  return request.auth != null;
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------- ORDERS ----------------
+    // Public visitors can CREATE an order (checkout) but can never
+    // read other people's orders, or edit/delete any order — only
+    // the signed-in admin can do that (status updates, etc).
+    match /orders/{orderId} {
+      allow create: if
+        request.resource.data.keys().hasAll(['name','phone','address','city','pincode','state','product','amount','status']) &&
+        request.resource.data.name is string  && request.resource.data.name.size()  > 0 && request.resource.data.name.size()  < 100 &&
+        request.resource.data.phone is string && request.resource.data.phone.size() >= 10 && request.resource.data.phone.size() < 20 &&
+        request.resource.data.pincode is string && request.resource.data.pincode.size() == 6 &&
+        request.resource.data.amount is number && request.resource.data.amount > 0 && request.resource.data.amount < 1000000 &&
+        request.resource.data.status in ['Pending', 'Payment Failed'];   // can't self-mark as Shipped/Delivered/Cancelled
+      allow update: if
+        isAdmin() ||
+        (
+          // This covers the one legitimate non-admin case: the SAME checkout
+          // attempt (same doc ID = idempotencyKey) retrying after a failed
+          // payment, e.g. card declined then retried successfully in the same
+          // Razorpay popup. Core order details can't change on that update —
+          // only status/paymentId/failureReason are allowed to move.
+          request.resource.data.status in ['Pending', 'Payment Failed'] &&
+          request.resource.data.amount   == resource.data.amount &&
+          request.resource.data.phone    == resource.data.phone &&
+          request.resource.data.product  == resource.data.product &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','paymentId','failureReason','createdAt'])
+        );
+      allow read, delete: if isAdmin();
+    }
+
+    // ---------------- CATEGORIES ----------------
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ---------------- COUPONS ----------------
+    // Doc ID = the coupon code itself. Public can GET a single coupon by
+    // exact code (to validate it at checkout) but can never LIST the whole
+    // collection (which would let someone enumerate every active code).
+    // Public can also bump usedCount by exactly 1 when redeeming — nothing else.
+    match /coupons/{code} {
+      allow get: if true;
+      allow list: if isAdmin();
+      allow update: if isAdmin() ||
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedCount']) &&
+          request.resource.data.usedCount == resource.data.usedCount + 1
+        );
+      allow create, delete: if isAdmin();
+    }
+
+    // ---------------- CUSTOMER NOTES ----------------
+    // Admin-only internal tags/notes about a customer, keyed by phone number.
+    match /customerNotes/{phone} {
+      allow read, write: if isAdmin();
+    }
+
+    // ---------------- INVENTORY HISTORY ----------------
+    // Audit trail of manual stock changes — admin-only, written by the
+    // Inventory panel whenever a stock number is updated.
+    match /inventoryHistory/{entryId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ---------------- PRODUCTS ----------------
+    // Public can read — the storefront's live price/stock sync (index.html's
+    // syncProductsFromFirestore) depends on this. Only the admin can write.
+    match /products/{productId} {
+      allow read: if true;
+      allow write: if isAdmin() &&
+        (!('stock' in request.resource.data) || request.resource.data.stock >= 0);
+    }
+
+    // ---------------- VIDEO REVIEWS ----------------
+    // Public can submit a review (always starts as 'pending' — they
+    // cannot set their own review to 'approved'). Public can read
+    // only approved reviews. Public can increment likes on an
+    // already-approved review, and nothing else. Approve/reject/
+    // delete is admin-only.
+    match /videoReviews/{reviewId} {
+      allow create: if
+        request.resource.data.status == 'pending' &&
+        request.resource.data.likes == 0 &&
+        request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() < 100 &&
+        request.resource.data.videoUrl is string;
+
+      allow read: if resource.data.status == 'approved' || isAdmin();
+
+      // Anonymous visitors may ONLY touch the `likes` field on an approved
+      // review, and only by exactly +1 (like) or -1 (unlike — the gallery's
+      // heart button is a toggle). Everything else is admin-only.
+      allow update: if isAdmin() ||
+        (
+          resource.data.status == 'approved' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes']) &&
+          request.resource.data.likes >= 0 &&
+          (request.resource.data.likes == resource.data.likes + 1 || request.resource.data.likes == resource.data.likes - 1)
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // Everything else: closed by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
